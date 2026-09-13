@@ -253,6 +253,21 @@ def message_received_time(message) -> datetime:
         return datetime.now(HK_TIMEZONE).replace(tzinfo=None)
 
 
+def is_reply_or_forward(message, subject: str) -> bool:
+    if re.match(r"^(?:re|fw|fwd|回覆|回复|轉寄|转发)\s*[:：]", subject, re.IGNORECASE):
+        return True
+    return bool(str(getattr(message, "InReplyTo", "") or "").strip())
+
+
+def has_supported_attachment(message) -> bool:
+    attachments = message.Attachments
+    for index in range(1, int(attachments.Count) + 1):
+        filename = str(getattr(attachments.Item(index), "FileName", "") or "")
+        if Path(filename).suffix.lower() in ALLOWED_EXTENSIONS:
+            return True
+    return False
+
+
 def save_message_file(message, mbl_folder: Path, subject: str, local_msg_path: Path | None) -> Path:
     mbl_folder.mkdir(parents=True, exist_ok=True)
     if local_msg_path is not None:
@@ -298,13 +313,21 @@ def download_attachments(message, mbl_folder: Path) -> tuple[int, int, int]:
 
 
 def process_message(message, source_id: str, processed_ids: set[str], local_msg_path: Path | None = None) -> dict[str, int]:
-    result = {"matched": 0, "already_processed": 0, "processed": 0, "downloaded": 0, "failed": 0, "fallback": 0, "msg_saved": 0}
+    result = {"matched": 0, "already_processed": 0, "skipped_reply_forward": 0, "skipped_no_supported_attachment": 0, "processed": 0, "downloaded": 0, "failed": 0, "fallback": 0, "msg_saved": 0}
     subject = str(getattr(message, "Subject", "") or "").strip()
     display_progress(f"檢查郵件：{subject or '[沒有主旨]'}")
     if not any(keyword.casefold() in subject.casefold() for keyword in SUBJECT_KEYWORDS):
         display_progress("略過：郵件主旨冇指定關鍵字。")
         return result
     result["matched"] = 1
+    if is_reply_or_forward(message, subject):
+        result["skipped_reply_forward"] = 1
+        display_progress("略過：郵件係回覆或轉寄。")
+        return result
+    if not has_supported_attachment(message):
+        result["skipped_no_supported_attachment"] = 1
+        display_progress("略過：郵件冇 PDF 或 XLSX 附件。")
+        return result
     if not REPROCESS_ALREADY_PROCESSED and source_id and source_id in processed_ids:
         result["already_processed"] = 1
         display_progress("略過：郵件之前已經處理。")
@@ -410,7 +433,7 @@ def process_msg_folder(namespace, processed_ids: set[str], summary: dict[str, in
 
 
 def main() -> None:
-    summary = {"scanned": 0, "matched": 0, "already_processed": 0, "processed": 0, "downloaded": 0, "failed": 0, "fallback": 0, "msg_saved": 0}
+    summary = {"scanned": 0, "matched": 0, "already_processed": 0, "skipped_reply_forward": 0, "skipped_no_supported_attachment": 0, "processed": 0, "downloaded": 0, "failed": 0, "fallback": 0, "msg_saved": 0}
     display_progress("Outlook 附件下載程式開始執行。")
     pythoncom.CoInitialize()
     try:
@@ -427,6 +450,8 @@ def main() -> None:
             f"已掃描項目：{summary['scanned']}\n"
             f"符合關鍵字郵件：{summary['matched']}\n"
             f"略過已處理郵件：{summary['already_processed']}\n"
+            f"略過回覆或轉寄郵件：{summary['skipped_reply_forward']}\n"
+            f"略過冇 PDF 或 XLSX 附件郵件：{summary['skipped_no_supported_attachment']}\n"
             f"今次處理郵件：{summary['processed']}\n"
             f"已儲存或複製 MSG：{summary['msg_saved']}\n"
             f"成功下載附件：{summary['downloaded']}\n"

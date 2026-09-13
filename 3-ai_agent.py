@@ -29,6 +29,7 @@ SPECIFIC_REPORT_FOLDER = None
 ASSET_DIR = Path(r"C:\Scripts\海外逆向到货")
 ATTACHMENT_ROOT = ASSET_DIR / "Attachments" / "海外逆向到货"
 OUTPUT_FOLDER = "報告生成"
+TAKEAWAY_PATH = ASSET_DIR / "takeaway.json"
 DRAFT_REPORT_NAME = "Draft_Report_REVIEW_REQUIRED.xlsx"
 FINAL_REPORT_NAME = "Final_Report.xlsx"
 API_CHAT_PATH = "/chat/completions"
@@ -41,6 +42,7 @@ MIN_ACCEPTED_CONFIDENCE = 0.70
 MAX_EVIDENCE_ITEMS = 12
 MAX_EVIDENCE_CHARACTERS = 14000
 KEEP_AI_RESPONSE_JSON = True
+GENERATE_TAKEAWAY = True
 OVERWRITE_FINAL_REPORT = True
 REPROCESS_COMPLETED_REPORTS = False
 HK_TIMEZONE = ZoneInfo("Asia/Hong_Kong")
@@ -396,6 +398,47 @@ def task_prompt(task: dict[str, Any], evidence: dict[str, Any], shipment_context
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+TAKEAWAY_FIELDS = {"req_number", "transport_mode", "trade_term", "declaration_company", "seller_name", "seller_address", "buyer_name", "buyer_address", "departure_country", "departure_port", "mbl", "hbl", "document_type", "items", "unit_price"}
+
+
+def takeaway_prompt(report: dict[str, Any], resolved: list[dict[str, Any]], unresolved: list[dict[str, Any]], rejected: list[dict[str, Any]]) -> list[dict[str, str]]:
+    outcomes = []
+    for result in resolved + unresolved + rejected:
+        outcomes.append({"task_id": result.get("task_id"), "entity_type": result.get("entity_type"), "field": result.get("field"), "line_id": result.get("line_id"), "status": result.get("status"), "confidence": result.get("confidence"), "reason": result.get("reason"), "provenance": result.get("provenance", [])})
+    payload = {
+        "instruction": "Identify reusable extraction lessons from this completed review. Return only lessons that can improve future Step 2 extraction or Step 3 evidence review. Do not include shipment-specific values, personal data, or guesses.",
+        "report_summary": {"document_types": [item.get("classification", {}).get("document_type") for item in report.get("shipments", [{}])[0].get("documents", [])], "review_outcomes": outcomes},
+        "required_output": {"schema_version": "1.0", "lessons": [{"field": "departure_port", "document_type": "arrival_notice", "signal": "label or reliable pattern", "guidance": "reusable evidence-based guidance", "confidence": 0.0}]},
+    }
+    return [{"role": "system", "content": "You are a conservative data-pipeline learning reviewer. Use only the supplied JSON. Return exactly one JSON object and no Markdown. A lesson must be specific, repeatable, and supported by a resolved review result or a clear recurring failure. Never recommend changing locked or manual fields. Return an empty lessons array when there is no reusable lesson."}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}]
+
+
+def validate_takeaway(result: dict[str, Any]) -> dict[str, Any]:
+    lessons = result.get("lessons")
+    if not isinstance(lessons, list):
+        raise ValueError("TAKEAWAY_LESSONS_NOT_LIST")
+    validated = []
+    for lesson in lessons[:20]:
+        if not isinstance(lesson, dict) or norm(lesson.get("field")) not in TAKEAWAY_FIELDS:
+            continue
+        guidance = norm(lesson.get("guidance"))
+        if not guidance or len(guidance) > 600:
+            continue
+        try:
+            confidence = float(lesson.get("confidence", 0))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= confidence <= 1:
+            continue
+        validated.append({"field": norm(lesson.get("field")), "document_type": norm(lesson.get("document_type")), "signal": norm(lesson.get("signal"))[:240], "guidance": guidance, "confidence": confidence})
+    return {"schema_version": "1.0", "generated_at": utc_now(), "lessons": validated}
+
+
+def generate_takeaway(report: dict[str, Any], resolved: list[dict[str, Any]], unresolved: list[dict[str, Any]], rejected: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    result, usage = call_api(takeaway_prompt(report, resolved, unresolved, rejected))
+    return validate_takeaway(result), usage
+
+
 def task_key(item: dict[str, Any]) -> tuple[Any, ...]:
     return item.get("task_id"), item.get("entity_type"), item.get("field"), item.get("line_id")
 
@@ -646,6 +689,19 @@ def process_report_folder(report_dir: Path) -> dict[str, Any]:
             rejected.append(rejected_result)
             raw_results.append(rejected_result)
             progress(f"任務被拒絕：{task.get('field')}；{type(exc).__name__}: {exc}", "錯誤")
+    takeaway_status = "DISABLED"
+    takeaway_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    if GENERATE_TAKEAWAY:
+        try:
+            generated, takeaway_usage = generate_takeaway(report, resolved, unresolved, rejected)
+            if generated["lessons"]:
+                save_json(TAKEAWAY_PATH, generated)
+                takeaway_status = "UPDATED"
+            else:
+                takeaway_status = "NO_NEW_LESSONS"
+        except Exception as exc:
+            takeaway_status = "FAILED"
+            progress(f"takeaway.json 生成失敗：{type(exc).__name__}: {exc}", "警告")
     recalculate_dependencies(report)
     final = write_final_workbook(report_dir, report, resolved, unresolved + rejected)
     response = {"schema_version": "1.2", "job_id": request.get("job_id"), "generated_at": utc_now(), "source_policy": "JSON_ONLY", "task_results": raw_results, "summary": {"total": len(tasks), "resolved": len(resolved), "unresolved": len(unresolved), "rejected": len(rejected)}}
@@ -653,7 +709,7 @@ def process_report_folder(report_dir: Path) -> dict[str, Any]:
         save_json(report_dir / "ai_review_response.json", response)
     report["step3"] = {"status": "COMPLETED", "resolved": len(resolved), "unresolved": len(unresolved), "rejected": len(rejected), "final_report": str(final), "generated_at": utc_now()}
     save_json(report_dir / "extracted_report_after_ai.json", report)
-    summary = {"status": "COMPLETED", "generated_at": utc_now(), "report_dir": str(report_dir), "final_report": str(final), "resolved": len(resolved), "unresolved": len(unresolved), "rejected": len(rejected), "duration_seconds": round(time.time() - started, 2), "usage": {"prompt_tokens": total_prompt_tokens, "completion_tokens": total_completion_tokens}}
+    summary = {"status": "COMPLETED", "generated_at": utc_now(), "report_dir": str(report_dir), "final_report": str(final), "resolved": len(resolved), "unresolved": len(unresolved), "rejected": len(rejected), "takeaway_status": takeaway_status, "duration_seconds": round(time.time() - started, 2), "usage": {"prompt_tokens": total_prompt_tokens, "completion_tokens": total_completion_tokens, "takeaway_prompt_tokens": int(takeaway_usage.get("prompt_tokens", 0) or 0), "takeaway_completion_tokens": int(takeaway_usage.get("completion_tokens", 0) or 0)}}
     save_json(report_dir / "step3_processing_summary.json", summary)
     progress(f"Step 3 完成：已解決={len(resolved)}；未解決={len(unresolved)}；拒絕={len(rejected)}")
     progress(f"最終報表：{final}")
