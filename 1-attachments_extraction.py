@@ -259,13 +259,14 @@ def is_reply_or_forward(message, subject: str) -> bool:
     return bool(str(getattr(message, "InReplyTo", "") or "").strip())
 
 
-def has_supported_attachment(message) -> bool:
+def scan_supported_attachments(message) -> list[tuple[int, str]]:
     attachments = message.Attachments
-    for index in range(1, int(attachments.Count) + 1):
+    supported = []
+    for index in range(1, int(getattr(attachments, "Count", 0)) + 1):
         filename = str(getattr(attachments.Item(index), "FileName", "") or "")
         if Path(filename).suffix.lower() in ALLOWED_EXTENSIONS:
-            return True
-    return False
+            supported.append((index, filename))
+    return supported
 
 
 def save_message_file(message, mbl_folder: Path, subject: str, local_msg_path: Path | None) -> Path:
@@ -282,24 +283,15 @@ def save_message_file(message, mbl_folder: Path, subject: str, local_msg_path: P
     return destination
 
 
-def download_attachments(message, mbl_folder: Path) -> tuple[int, int, int]:
+def download_attachments(message, supported: list[tuple[int, str]], mbl_folder: Path) -> tuple[int, int]:
     attachments_folder = mbl_folder / "Attachments"
     downloaded = 0
     failed = 0
-    supported = 0
-    attachments = message.Attachments
-    count = int(attachments.Count)
-    display_progress(f"郵件共有 {count} 個附件。")
-    for index in range(1, count + 1):
+    display_progress(f"郵件共有 {len(supported)} 個支援附件。")
+    for index, filename in supported:
         try:
-            attachment = attachments.Item(index)
-            filename = str(getattr(attachment, "FileName", "") or "attachment")
-            extension = Path(filename).suffix.lower()
-            display_progress(f"檢查附件 {index}/{count}：{filename}")
-            if extension not in ALLOWED_EXTENSIONS:
-                display_progress(f"略過不支援嘅附件：{filename}")
-                continue
-            supported += 1
+            attachment = message.Attachments.Item(index)
+            display_progress(f"下載附件 {index}：{filename}")
             attachments_folder.mkdir(parents=True, exist_ok=True)
             destination = unique_file_path(attachments_folder, filename)
             attachment.SaveAsFile(str(destination))
@@ -307,9 +299,9 @@ def download_attachments(message, mbl_folder: Path) -> tuple[int, int, int]:
             display_progress(f"附件下載完成：{destination}")
         except Exception:
             failed += 1
-            display_progress(f"附件 {index} 下載失敗。")
-            LOGGER.exception("附件 %d 下載失敗。", index)
-    return downloaded, failed, supported
+            display_progress(f"附件 {index} 下載失敗：{filename}")
+            LOGGER.exception("附件 %d 下載失敗：%s", index, filename)
+    return downloaded, failed
 
 
 def process_message(message, source_id: str, processed_ids: set[str], local_msg_path: Path | None = None) -> dict[str, int]:
@@ -324,13 +316,14 @@ def process_message(message, source_id: str, processed_ids: set[str], local_msg_
         result["skipped_reply_forward"] = 1
         display_progress("略過：郵件係回覆或轉寄。")
         return result
-    if not has_supported_attachment(message):
-        result["skipped_no_supported_attachment"] = 1
-        display_progress("略過：郵件冇 PDF 或 XLSX 附件。")
-        return result
     if not REPROCESS_ALREADY_PROCESSED and source_id and source_id in processed_ids:
         result["already_processed"] = 1
         display_progress("略過：郵件之前已經處理。")
+        return result
+    supported = scan_supported_attachments(message)
+    if not supported:
+        result["skipped_no_supported_attachment"] = 1
+        display_progress("略過：郵件冇 PDF 或 XLSX 附件。")
         return result
     folder_name, reference_type = get_destination_folder_name(subject)
     received_time = message_received_time(message)
@@ -349,11 +342,9 @@ def process_message(message, source_id: str, processed_ids: set[str], local_msg_
         result["failed"] += 1
         display_progress("MSG 檔案儲存或複製失敗。")
         LOGGER.exception("MSG 檔案儲存或複製失敗。")
-    downloaded, failed, supported = download_attachments(message, mbl_folder)
+    downloaded, failed = download_attachments(message, supported, mbl_folder)
     result["downloaded"] = downloaded
     result["failed"] += failed
-    if supported == 0:
-        display_progress("郵件冇 PDF 或 XLSX 附件。")
     if operation_failed or failed > 0:
         display_progress("因為有檔案處理失敗，郵件唔會標記為已處理。")
         return result
