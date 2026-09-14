@@ -37,12 +37,14 @@ API_TIMEOUT_SECONDS = 240
 API_MAX_RETRIES = 3
 API_RETRY_SECONDS = 3
 MODEL_TEMPERATURE = 0.0
-MODEL_MAX_TOKENS = 1800
+MODEL_MAX_TOKENS = 4096
 MIN_ACCEPTED_CONFIDENCE = 0.70
 MAX_EVIDENCE_ITEMS = 12
 MAX_EVIDENCE_CHARACTERS = 14000
 KEEP_AI_RESPONSE_JSON = True
-GENERATE_TAKEAWAY = True
+DISABLE_MODEL_THINKING = True
+SAVE_LAST_API_RESPONSE = True
+GENERATE_TAKEAWAY = False
 OVERWRITE_FINAL_REPORT = True
 REPROCESS_COMPLETED_REPORTS = False
 HK_TIMEZONE = ZoneInfo("Asia/Hong_Kong")
@@ -261,43 +263,123 @@ def extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("MODEL_JSON_INCOMPLETE")
 
 
+def api_content_candidates(response_data: dict[str, Any]) -> list[tuple[str, str]]:
+    candidates = []
+    choices = response_data.get("choices") or []
+    if choices:
+        choice = choices[0] or {}
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            candidates.append(("message.content", content))
+        elif isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    for key in ("text", "content", "output_text"):
+                        value = item.get(key)
+                        if isinstance(value, str) and value.strip():
+                            parts.append(value)
+            if parts:
+                candidates.append(("message.content[]", "".join(parts)))
+        for key in ("reasoning_content", "reasoning", "analysis"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append((f"message.{key}", value))
+        for key in ("text", "output_text"):
+            value = choice.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append((f"choice.{key}", value))
+    for key in ("output_text", "text", "response"):
+        value = response_data.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append((key, value))
+    output = response_data.get("output")
+    if isinstance(output, list):
+        for output_index, item in enumerate(output):
+            if not isinstance(item, dict):
+                continue
+            value = item.get("content") or item.get("text")
+            if isinstance(value, str) and value.strip():
+                candidates.append((f"output[{output_index}]", value))
+            elif isinstance(value, list):
+                for content_index, content_item in enumerate(value):
+                    if isinstance(content_item, dict):
+                        text = content_item.get("text") or content_item.get("content")
+                        if isinstance(text, str) and text.strip():
+                            candidates.append((f"output[{output_index}].content[{content_index}]", text))
+    return candidates
+
+
+def response_diagnostics(response_data: dict[str, Any]) -> str:
+    choices = response_data.get("choices") or []
+    choice = choices[0] if choices else {}
+    message = choice.get("message") or {} if isinstance(choice, dict) else {}
+    return json.dumps({
+        "top_level_keys": sorted(response_data.keys()),
+        "choice_keys": sorted(choice.keys()) if isinstance(choice, dict) else [],
+        "message_keys": sorted(message.keys()) if isinstance(message, dict) else [],
+        "finish_reason": choice.get("finish_reason") if isinstance(choice, dict) else None,
+        "usage": response_data.get("usage") or {},
+        "content_type": type(message.get("content")).__name__ if isinstance(message, dict) else None,
+        "content_is_empty": not bool(message.get("content")) if isinstance(message, dict) else True,
+    }, ensure_ascii=False)
+
+
 def call_api(messages: list[dict[str, str]]) -> tuple[dict[str, Any], dict[str, Any]]:
-    payload = {
+    base_payload = {
         "model": MODEL_NAME,
         "messages": messages,
         "temperature": MODEL_TEMPERATURE,
         "max_tokens": MODEL_MAX_TOKENS,
         "stream": False,
     }
+    if DISABLE_MODEL_THINKING:
+        base_payload["chat_template_kwargs"] = {"enable_thinking": False}
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if API_KEY.strip():
         headers["Authorization"] = f"Bearer {API_KEY.strip()}"
     last_error = None
+    optional_payload_removed = False
     for attempt in range(1, API_MAX_RETRIES + 1):
+        payload = dict(base_payload)
+        if optional_payload_removed:
+            payload.pop("chat_template_kwargs", None)
         try:
             request = urllib.request.Request(endpoint_url(), data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
             with urllib.request.urlopen(request, timeout=API_TIMEOUT_SECONDS) as response:
-                response_data = json.loads(response.read().decode("utf-8"))
-            choices = response_data.get("choices") or []
-            if not choices:
-                raise ValueError("API_RESPONSE_HAS_NO_CHOICES")
-            message = choices[0].get("message") or {}
-            content = message.get("content")
-            if isinstance(content, list):
-                content = "".join(str(item.get("text", "")) if isinstance(item, dict) else str(item) for item in content)
-            if not isinstance(content, str):
-                raise ValueError("API_RESPONSE_HAS_NO_CONTENT")
-            return extract_json_object(content), response_data.get("usage") or {}
+                raw_body = response.read().decode("utf-8", errors="replace")
+            response_data = json.loads(raw_body)
+            if SAVE_LAST_API_RESPONSE:
+                save_json(ASSET_DIR / "step3_last_api_response.json", response_data)
+            candidates = api_content_candidates(response_data)
+            parse_errors = []
+            for source_name, content in candidates:
+                try:
+                    parsed = extract_json_object(content)
+                    parsed["_response_source"] = source_name
+                    return parsed, response_data.get("usage") or {}
+                except Exception as exc:
+                    parse_errors.append(f"{source_name}: {type(exc).__name__}: {exc}")
+            diagnostics = response_diagnostics(response_data)
+            if candidates:
+                raise ValueError(f"API_RESPONSE_HAS_NO_VALID_JSON; {diagnostics}; parse_errors={parse_errors[:5]}")
+            raise ValueError(f"API_RESPONSE_HAS_NO_CONTENT; {diagnostics}")
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")[:2000]
-            last_error = RuntimeError(f"HTTP {exc.code}: {body}")
+            body = exc.read().decode("utf-8", errors="replace")[:3000]
+            if exc.code == 400 and "chat_template_kwargs" in base_payload and not optional_payload_removed:
+                optional_payload_removed = True
+                last_error = RuntimeError(f"HTTP 400 with thinking control; retrying without optional parameter: {body}")
+            else:
+                last_error = RuntimeError(f"HTTP {exc.code}: {body}")
         except Exception as exc:
             last_error = exc
         progress(f"API 呼叫失敗，嘗試 {attempt}/{API_MAX_RETRIES}：{type(last_error).__name__}: {last_error}", "警告")
         if attempt < API_MAX_RETRIES:
             time.sleep(API_RETRY_SECONDS * attempt)
     raise RuntimeError(f"API_CALL_FAILED: {last_error}")
-
 
 def referenced_document_ids(task: dict[str, Any]) -> set[str]:
     ids = set()
@@ -348,7 +430,20 @@ def compact_task_evidence(task: dict[str, Any], report_dir: Path, manifest: dict
         elif content.get("kind") == "workbook":
             excerpt["sheets"] = []
             for sheet in content.get("sheets", []):
-                sheet_item = {"name": sheet.get("name"), "visibility": sheet.get("visibility"), "classification": sheet.get("classification"), "merged_ranges": sheet.get("merged_ranges", []), "rows": sheet.get("rows", [])[:150]}
+                all_rows = sheet.get("rows", [])
+                selected_rows = all_rows[:150]
+                if task.get("entity_type") == "item" and task.get("line_id"):
+                    parts = str(task.get("line_id")).rsplit(":", 2)
+                    target_sheet = parts[-2] if len(parts) >= 3 else None
+                    try:
+                        target_row = int(parts[-1])
+                    except Exception:
+                        target_row = None
+                    if target_sheet == sheet.get("name") and target_row is not None:
+                        nearby = [row for row in all_rows if target_row - 3 <= int(row.get("row", -999999)) <= target_row + 3]
+                        selected_rows = list({int(row.get("row", 0)): row for row in selected_rows[:20] + nearby}.values())
+                        selected_rows.sort(key=lambda row: int(row.get("row", 0)))
+                sheet_item = {"name": sheet.get("name"), "visibility": sheet.get("visibility"), "classification": sheet.get("classification"), "merged_ranges": sheet.get("merged_ranges", []), "rows": selected_rows}
                 serialized = json.dumps(sheet_item, ensure_ascii=False, default=str)
                 if used + len(serialized) > MAX_EVIDENCE_CHARACTERS:
                     sheet_item["rows"] = sheet_item["rows"][:30]
@@ -473,6 +568,7 @@ def task_key(item: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def validate_model_result(task: dict[str, Any], result: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    result.pop("_response_source", None)
     for key in ("task_id", "entity_type", "field"):
         if result.get(key) != task.get(key):
             raise ValueError(f"TASK_MISMATCH_{key.upper()}")
